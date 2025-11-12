@@ -4,6 +4,36 @@ import { XHSContent, XHSNote, XHSMedia } from './types'
 import axios from 'axios'
 import * as cheerio from 'cheerio'
 
+// 安全检查函数
+function isPrivateIP(hostname: string): boolean {
+  const privateRanges = [
+    /^10\./,
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./,
+    /^192\.168\./,
+    /^127\./,
+    /^169\.254\./,
+    /^::1$/,
+    /^fc00:/,
+    /^fe80:/
+  ]
+  return privateRanges.some(range => range.test(hostname))
+}
+
+function isLocalhost(hostname: string): boolean {
+  return hostname === 'localhost' || hostname === '0.0.0.0' || hostname === '::1'
+}
+
+// 安全地清理HTML内容，移除潜在的危险脚本和属性
+function sanitizeHtml(html: string): string {
+  return html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/on\w+="[^"]*"/gi, '')
+    .replace(/on\w+='[^']*'/gi, '')
+    .replace(/javascript:/gi, '')
+    .replace(/vbscript:/gi, '')
+    .replace(/data:/gi, '')
+}
+
 export class XHSClient {
   private cache = new Map<string, { data: XHSContent; timestamp: number }>()
   private logger: Logger
@@ -40,7 +70,8 @@ export class XHSClient {
       return content
     } catch (error) {
       this.logger.error('获取内容失败:', error)
-      return null
+      // 不要暴露详细错误信息给调用方
+      throw new Error('内容获取失败')
     }
   }
   
@@ -60,7 +91,14 @@ export class XHSClient {
         const response = await axios.get(url, {
           headers,
           timeout: this.config.requestTimeout || 10000,
-          maxRedirects: 5
+          maxRedirects: 5,
+          // 安全配置：禁止跟随到内网重定向
+          beforeRedirect: (options, response) => {
+            const hostname = options.hostname?.toLowerCase()
+            if (hostname && (isPrivateIP(hostname) || isLocalhost(hostname))) {
+              throw new Error('禁止重定向到内网地址')
+            }
+          }
         })
         
         return this.parseContent(response.data, url)
@@ -85,6 +123,23 @@ export class XHSClient {
     
     try {
       await page.setUserAgent(this.config.userAgent)
+      
+      // 安全配置：禁用不必要的功能
+      await page.evaluateOnNewDocument(`
+        // 禁用 navigator.webdriver
+        Object.defineProperty(navigator, 'webdriver', {
+          get: () => undefined,
+        });
+        
+        // 修改 permissions
+        const originalQuery = navigator.permissions.query;
+        navigator.permissions.query = (parameters) => (
+          parameters.name === 'notifications' ?
+            Promise.resolve({ state: Notification.permission }) :
+            originalQuery(parameters)
+        );
+      `)
+      
       await page.goto(url, {
         waitUntil: 'networkidle2',
         timeout: this.config.puppeteerTimeout || 30000
@@ -103,7 +158,9 @@ export class XHSClient {
   }
   
   private parseContent(html: string, url: string): XHSContent {
-    const $ = cheerio.load(html)
+    // 清理HTML内容，移除潜在的安全风险
+    const sanitizedHtml = sanitizeHtml(html)
+    const $ = cheerio.load(sanitizedHtml)
     
     // 提取标题
     const title = $('meta[property="og:title"]').attr('content') ||

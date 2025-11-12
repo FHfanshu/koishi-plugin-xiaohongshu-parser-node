@@ -6,6 +6,16 @@ export function parseXHSUrl(url: string): ParsedURL | null {
   // 清理URL
   url = url.trim()
   
+  // 基础安全检查：限制URL长度
+  if (url.length > 2048) {
+    return null
+  }
+  
+  // 检查是否包含危险字符
+  if (/[<>"'\\]/.test(url)) {
+    return null
+  }
+  
   // 小红书短链接
   const shortLinkMatch = url.match(/xhslink\.com\/([a-zA-Z0-9]+)/)
   if (shortLinkMatch) {
@@ -195,7 +205,21 @@ export function filterContent(content: string, blockedKeywords: string[]): boole
 export function validateUrl(url: string, allowedDomains: string[]): boolean {
   try {
     const parsed = new URL(url)
+    
+    // 检查协议
+    if (!['http:', 'https:'].includes(parsed.protocol)) {
+      return false
+    }
+    
+    // 检查主机名
     const host = parsed.hostname.toLowerCase()
+    
+    // 防止SSRF：禁止访问内网地址
+    if (isPrivateIP(host) || isLocalhost(host)) {
+      return false
+    }
+    
+    // 检查允许的域名
     return allowedDomains.some((domain) => {
       const d = domain.toLowerCase().trim()
       if (!d) return false
@@ -204,6 +228,26 @@ export function validateUrl(url: string, allowedDomains: string[]): boolean {
   } catch {
     return false
   }
+}
+
+function isPrivateIP(hostname: string): boolean {
+  // 检查是否为私有IP地址
+  const privateRanges = [
+    /^10\./,
+    /^172\.(1[6-9]|2[0-9]|3[0-1])\./,
+    /^192\.168\./,
+    /^127\./,
+    /^169\.254\./,
+    /^::1$/,
+    /^fc00:/,
+    /^fe80:/
+  ]
+  
+  return privateRanges.some(range => range.test(hostname))
+}
+
+function isLocalhost(hostname: string): boolean {
+  return hostname === 'localhost' || hostname === '0.0.0.0' || hostname === '::1'
 }
 
 function formatNumber(num: number): string {

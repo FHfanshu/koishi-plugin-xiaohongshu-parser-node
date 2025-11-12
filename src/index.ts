@@ -137,7 +137,8 @@ export function apply(ctx: Context, config: Config) {
         
       } catch (error) {
         logger.error('解析失败:', error)
-        return '解析失败，请稍后重试'
+        // 避免泄露详细错误信息
+        return '解析失败，请检查链接是否有效或稍后重试'
       }
     })
   
@@ -180,6 +181,7 @@ export function apply(ctx: Context, config: Config) {
         }
       } catch (error) {
         logger.error('自动解析失败:', error)
+        // 静默处理错误，避免信息泄露
       }
     }
     
