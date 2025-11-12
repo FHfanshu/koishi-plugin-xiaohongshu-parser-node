@@ -1,41 +1,30 @@
 import { Context, Logger, Time } from 'koishi'
 import type { Config } from './index'
-import { XHSContent, XHSNote, XHSMedia } from './types'
+import { XHSContent, XHSMedia } from './types'
+import {
+  isPrivateIP,
+  isLocalhost,
+  sanitizeHtml,
+  safeJsonParse,
+  deduplicateMedia,
+  hasPuppeteer
+} from './utils'
 import axios from 'axios'
 import * as cheerio from 'cheerio'
 
-// 安全检查函数
-function isPrivateIP(hostname: string): boolean {
-  const privateRanges = [
-    /^10\./,
-    /^172\.(1[6-9]|2[0-9]|3[0-1])\./,
-    /^192\.168\./,
-    /^127\./,
-    /^169\.254\./,
-    /^::1$/,
-    /^fc00:/,
-    /^fe80:/
-  ]
-  return privateRanges.some(range => range.test(hostname))
-}
+// 常量定义
+const MAX_CACHE_SIZE = 200 // LRU 缓存最大容量
+const CACHE_CLEANUP_INTERVAL = Time.minute * 5
 
-function isLocalhost(hostname: string): boolean {
-  return hostname === 'localhost' || hostname === '0.0.0.0' || hostname === '::1'
-}
-
-// 安全地清理HTML内容，移除潜在的危险脚本和属性
-function sanitizeHtml(html: string): string {
-  return html
-    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
-    .replace(/on\w+="[^"]*"/gi, '')
-    .replace(/on\w+='[^']*'/gi, '')
-    .replace(/javascript:/gi, '')
-    .replace(/vbscript:/gi, '')
-    .replace(/data:/gi, '')
+interface CacheEntry {
+  data: XHSContent
+  timestamp: number
+  accessCount: number
 }
 
 export class XHSClient {
-  private cache = new Map<string, { data: XHSContent; timestamp: number }>()
+  private cache = new Map<string, CacheEntry>()
+  private cacheAccessOrder: string[] = [] // LRU 跟踪
   private logger: Logger
   private cleanupTimer?: NodeJS.Timeout
   
@@ -47,31 +36,84 @@ export class XHSClient {
   async getContent(url: string, forceRefresh = false): Promise<XHSContent | null> {
     // 检查缓存
     if (!forceRefresh && this.config.enableCache) {
-      const cached = this.cache.get(url)
-      if (cached && Date.now() - cached.timestamp < (this.config.cacheTimeout || 3600000)) {
+      const cached = this.getCachedContent(url)
+      if (cached) {
         this.logger.debug('使用缓存内容')
-        return cached.data
+        return cached
       }
     }
     
     try {
       let content: XHSContent | null
       
-      if ((this.config.enablePuppeteer ?? false) && (this.ctx as any).puppeteer) {
+      if ((this.config.enablePuppeteer ?? false) && hasPuppeteer(this.ctx)) {
         content = await this.getContentWithPuppeteer(url)
       } else {
         content = await this.getContentWithAxios(url)
       }
       
       if (content && this.config.enableCache) {
-        this.cache.set(url, { data: content, timestamp: Date.now() })
+        this.setCachedContent(url, content)
       }
       
       return content
     } catch (error) {
-      this.logger.error('获取内容失败:', error)
-      // 不要暴露详细错误信息给调用方
+      this.logger.error('获取内容失败')
+      if (this.config.enableDebugLog && error instanceof Error) {
+        this.logger.debug('错误详情:', error.message)
+      }
       throw new Error('内容获取失败')
+    }
+  }
+  
+  // LRU 缓存获取
+  private getCachedContent(url: string): XHSContent | null {
+    const cached = this.cache.get(url)
+    if (!cached) return null
+    
+    const isExpired = Date.now() - cached.timestamp >= (this.config.cacheTimeout || Time.hour)
+    if (isExpired) {
+      this.cache.delete(url)
+      this.removeFromAccessOrder(url)
+      return null
+    }
+    
+    // 更新访问顺序（LRU）
+    cached.accessCount++
+    this.updateAccessOrder(url)
+    return cached.data
+  }
+  
+  // LRU 缓存设置
+  private setCachedContent(url: string, content: XHSContent): void {
+    // 如果缓存已满，移除最少使用的项
+    if (this.cache.size >= MAX_CACHE_SIZE && !this.cache.has(url)) {
+      const lruKey = this.cacheAccessOrder[0]
+      if (lruKey) {
+        this.cache.delete(lruKey)
+        this.cacheAccessOrder.shift()
+      }
+    }
+    
+    this.cache.set(url, {
+      data: content,
+      timestamp: Date.now(),
+      accessCount: 1
+    })
+    this.updateAccessOrder(url)
+  }
+  
+  // 更新访问顺序
+  private updateAccessOrder(url: string): void {
+    this.removeFromAccessOrder(url)
+    this.cacheAccessOrder.push(url)
+  }
+  
+  // 从访问顺序中移除
+  private removeFromAccessOrder(url: string): void {
+    const index = this.cacheAccessOrder.indexOf(url)
+    if (index > -1) {
+      this.cacheAccessOrder.splice(index, 1)
     }
   }
   
@@ -115,11 +157,11 @@ export class XHSClient {
   }
   
   private async getContentWithPuppeteer(url: string): Promise<XHSContent | null> {
-    if (!(this.ctx as any).puppeteer) {
+    if (!hasPuppeteer(this.ctx)) {
       throw new Error('Puppeteer 服务未启用')
     }
     
-    const page = await (this.ctx as any).puppeteer.page()
+    const page = await this.ctx.puppeteer.page()
     
     try {
       await page.setUserAgent(this.config.userAgent)
@@ -191,15 +233,66 @@ export class XHSClient {
       }
     })
     
-    // 提取视频
+    // 提取视频 - 增强版本
     const videos: XHSMedia[] = []
+    
+    // 从 og:video 标签提取基础视频信息
     $('meta[property="og:video"]').each((_, element) => {
       const src = $(element).attr('content')
+      const type = $(element).attr('type') || ''
+      const width = parseInt($(element).attr('width') || '0') || 0
+      const height = parseInt($(element).attr('height') || '0') || 0
+      
       if (src && src.startsWith('http')) {
         videos.push({
           type: 'video',
           url: src,
-          duration: 0
+          width,
+          height,
+          duration: 0,
+          format: type.includes('mp4') ? 'mp4' : type.includes('mov') ? 'mov' : 'unknown'
+        })
+      }
+    })
+    
+    // 从 video 标签提取更详细的视频信息
+    $('video source').each((_, element) => {
+      const src = $(element).attr('src')
+      const type = $(element).attr('type') || ''
+      
+      if (src && (src.startsWith('http') || src.startsWith('//'))) {
+        const fullUrl = src.startsWith('//') ? 'https:' + src : src
+        videos.push({
+          type: 'video',
+          url: fullUrl,
+          width: 0,
+          height: 0,
+          duration: 0,
+          format: type.includes('mp4') ? 'mp4' : type.includes('mov') ? 'mov' : 'unknown'
+        })
+      }
+    })
+    
+    // 从 JSON-LD 数据中提取视频信息
+    $('script[type="application/ld+json"]').each((_, element) => {
+      const text = $(element).text() || ''
+      const json = safeJsonParse(text)
+      if (json && json.video) {
+        const videoArray = Array.isArray(json.video) ? json.video : [json.video]
+        videoArray.forEach((video: any) => {
+          if (video.contentUrl || video.url) {
+            const url = video.contentUrl || video.url
+            if (url && typeof url === 'string' && url.startsWith('http')) {
+              videos.push({
+                type: 'video',
+                url,
+                width: typeof video.width === 'number' && video.width > 0 ? video.width : 0,
+                height: typeof video.height === 'number' && video.height > 0 ? video.height : 0,
+                duration: typeof video.duration === 'number' && video.duration > 0 ? video.duration : 0,
+                format: video.encodingFormat || 'unknown'
+              })
+            }
+          }
         })
       }
     })
@@ -210,20 +303,8 @@ export class XHSClient {
     // 提取元数据
     const metadata = this.extractMetadata($)
     
-    const uniqueByUrl = (list: XHSMedia[]): XHSMedia[] => {
-      const seen = new Set<string>()
-      const out: XHSMedia[] = []
-      for (const m of list) {
-        if (!m?.url) continue
-        if (seen.has(m.url)) continue
-        seen.add(m.url)
-        out.push(m)
-      }
-      return out
-    }
-
-    const allImages = uniqueByUrl([...(images || []), ...((scriptData.images as XHSMedia[]) || [])])
-    const allVideos = uniqueByUrl([...(videos || []), ...((scriptData.videos as XHSMedia[]) || [])])
+    const allImages = deduplicateMedia([...(images || []), ...((scriptData.images as XHSMedia[]) || [])])
+    const allVideos = deduplicateMedia([...(videos || []), ...((scriptData.videos as XHSMedia[]) || [])])
 
     return {
       title: title.trim(),
@@ -275,62 +356,52 @@ export class XHSClient {
     const normalizeVideos = (input: any): XHSMedia[] => {
       return asArray(input).map((it: any) => {
         if (typeof it === 'string') {
-          return { type: 'video', url: it, duration: 0 } as XHSMedia
+          return { type: 'video', url: it, width: 0, height: 0, duration: 0, format: 'unknown' } as XHSMedia
         } else if (it && typeof it === 'object') {
-          const url = it.contentUrl || it.url || it.embedUrl
+          const url = it.contentUrl || it.url || it.embedUrl || it.src
+          const width = typeof it.width === 'number' ? it.width : 0
+          const height = typeof it.height === 'number' ? it.height : 0
           const duration = typeof it.duration === 'number' ? it.duration : 0
-          return url ? ({ type: 'video', url, duration } as XHSMedia) : null
+          const format = it.encodingFormat || it.format || (url.includes('.mp4') ? 'mp4' : url.includes('.mov') ? 'mov' : 'unknown')
+          return url ? ({ type: 'video', url, width, height, duration, format } as XHSMedia) : null
         }
         return null
       }).filter(Boolean) as XHSMedia[]
     }
 
     scripts.each((_, element) => {
-      try {
-        const text = $(element).text() || $(element).html() || ''
-        if (!text.trim()) return
-        const json = JSON.parse(text)
-        const items = Array.isArray(json) ? json : [json]
-        for (const item of items) {
-          if (!result.author) {
-            result.author = typeof item.author === 'string' ? item.author : item.author?.name
-          }
-          if (!result.publishTime && item.datePublished) {
-            const t = new Date(item.datePublished)
-            if (!Number.isNaN(t.getTime())) result.publishTime = t.getTime()
-          }
-          if (item.interactionStatistic && Array.isArray(item.interactionStatistic)) {
-            for (const s of item.interactionStatistic) {
-              const type = typeof s.interactionType === 'string' ? s.interactionType : (s.interactionType?.['@type'] || '')
-              const count = Number(s.userInteractionCount) || 0
-              if (/LikeAction/i.test(type)) result.likes = Math.max(result.likes || 0, count)
-              if (/CommentAction/i.test(type)) result.comments = Math.max(result.comments || 0, count)
-              if (/ShareAction/i.test(type)) result.shares = Math.max(result.shares || 0, count)
-              if (/CollectAction|SaveAction/i.test(type)) result.collects = Math.max(result.collects || 0, count)
-            }
-          }
-          result.images.push(...normalizeImages(item.image))
-          result.videos.push(...normalizeVideos(item.video || item.videoObject))
+      const text = $(element).text() || $(element).html() || ''
+      if (!text.trim()) return
+      
+      const json = safeJsonParse(text)
+      if (!json) return
+      
+      const items = Array.isArray(json) ? json : [json]
+      for (const item of items) {
+        if (!result.author) {
+          result.author = typeof item.author === 'string' ? item.author : item.author?.name
         }
-      } catch (error) {
-        this.logger.debug('脚本数据解析失败:', error)
+        if (!result.publishTime && item.datePublished) {
+          const t = new Date(item.datePublished)
+          if (!Number.isNaN(t.getTime())) result.publishTime = t.getTime()
+        }
+        if (item.interactionStatistic && Array.isArray(item.interactionStatistic)) {
+          for (const s of item.interactionStatistic) {
+            const type = typeof s.interactionType === 'string' ? s.interactionType : (s.interactionType?.['@type'] || '')
+            const count = Number(s.userInteractionCount) || 0
+            if (/LikeAction/i.test(type)) result.likes = Math.max(result.likes || 0, count)
+            if (/CommentAction/i.test(type)) result.comments = Math.max(result.comments || 0, count)
+            if (/ShareAction/i.test(type)) result.shares = Math.max(result.shares || 0, count)
+            if (/CollectAction|SaveAction/i.test(type)) result.collects = Math.max(result.collects || 0, count)
+          }
+        }
+        result.images.push(...normalizeImages(item.image))
+        result.videos.push(...normalizeVideos(item.video || item.videoObject))
       }
     })
 
-    const dedup = (arr: XHSMedia[]) => {
-      const seen = new Set<string>()
-      const out: XHSMedia[] = []
-      for (const m of arr) {
-        if (!m?.url) continue
-        if (seen.has(m.url)) continue
-        seen.add(m.url)
-        out.push(m)
-      }
-      return out
-    }
-
-    result.images = dedup(result.images)
-    result.videos = dedup(result.videos)
+    result.images = deduplicateMedia(result.images)
+    result.videos = deduplicateMedia(result.videos)
     return result
   }
   
@@ -358,11 +429,13 @@ export class XHSClient {
 
     this.cleanupTimer = setInterval(() => {
       const now = Date.now()
+      const timeout = this.config.cacheTimeout || Time.hour
       let cleaned = 0
 
       for (const [key, value] of this.cache.entries()) {
-        if (now - value.timestamp > (this.config.cacheTimeout || 3600000)) {
+        if (now - value.timestamp > timeout) {
           this.cache.delete(key)
+          this.removeFromAccessOrder(key)
           cleaned++
         }
       }
@@ -370,7 +443,7 @@ export class XHSClient {
       if (cleaned > 0) {
         this.logger.debug(`清理了 ${cleaned} 条过期缓存`)
       }
-    }, Time.minute * 5)
+    }, CACHE_CLEANUP_INTERVAL)
   }
 
   dispose(): void {

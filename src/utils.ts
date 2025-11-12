@@ -1,13 +1,18 @@
 import { h } from 'koishi'
-import { ParsedURL, XHSContent, FormattedContent, ForwardMessage } from './types'
+import { ParsedURL, XHSContent, XHSMedia, FormattedContent, ForwardMessage } from './types'
 import type { Config } from './index'
+
+// 常量定义
+const MAX_URL_LENGTH = 2048
+const MAX_JSON_SIZE = 1024 * 1024 // 1MB
+const MAX_LINK_MATCH_LENGTH = 500 // 单个链接最大长度
 
 export function parseXHSUrl(url: string): ParsedURL | null {
   // 清理URL
   url = url.trim()
   
   // 基础安全检查：限制URL长度
-  if (url.length > 2048) {
+  if (url.length > MAX_URL_LENGTH) {
     return null
   }
   
@@ -58,7 +63,7 @@ export function parseXHSUrl(url: string): ParsedURL | null {
 export function formatContent(content: XHSContent, config: Config): FormattedContent {
   const parts: string[] = []
   const imageUrls: string[] = []
-  const videoUrls: string[] = []
+  const videoUrls: XHSMedia[] = []
   
   // 标题
   parts.push(`📌 ${content.title}`)
@@ -101,9 +106,47 @@ export function formatContent(content: XHSContent, config: Config): FormattedCon
   }
   
   if (config.downloadVideos) {
-    content.videos.forEach(video => {
-      videoUrls.push(video.url)
-    })
+    videoUrls.push(...content.videos.slice(0, config.maxVideosPerMessage || 3))
+  }
+  
+  // 添加媒体统计信息
+  if ((content.images.length > 0 || content.videos.length > 0) && config.includeMetadata) {
+    const mediaInfo = []
+    if (content.images.length > 0) {
+      mediaInfo.push(`📸 图片 ${content.images.length}张`)
+    }
+    if (content.videos.length > 0 && config.showVideoMetadata) {
+      const videoInfo = []
+      videoInfo.push(`🎬 视频 ${content.videos.length}个`)
+      
+      // 显示视频详细信息
+      const videoDetails = []
+      for (const video of content.videos) {
+        const details = []
+        if (video.duration && video.duration > 0) {
+          details.push(formatDuration(video.duration))
+        }
+        if (video.width && video.height) {
+          details.push(`${video.width}x${video.height}`)
+        }
+        if (video.format && video.format !== 'unknown') {
+          details.push(video.format.toUpperCase())
+        }
+        if (details.length > 0) {
+          videoDetails.push(`(${details.join(', ')})`)
+        }
+      }
+      
+      if (videoDetails.length > 0) {
+        videoInfo.push(videoDetails.join(' '))
+      }
+      
+      mediaInfo.push(videoInfo.join(' '))
+    }
+    
+    if (mediaInfo.length > 0) {
+      parts.push(`📎 ${mediaInfo.join(' | ')}`)
+    }
   }
   
   // 构建最终内容
@@ -119,15 +162,15 @@ export function formatContent(content: XHSContent, config: Config): FormattedCon
   })
   
   // 添加视频
-  videoUrls.forEach(url => {
-    elements.push(h('video', { url }))
+  videoUrls.forEach(video => {
+    elements.push(h('video', { url: video.url }))
   })
   
   return {
     title: content.title,
     description: content.description,
     images: imageUrls,
-    videos: videoUrls,
+    videos: content.videos,
     author: content.author,
     stats: config.includeMetadata ? stats.join(' ') : '',
     tags: content.keywords,
@@ -135,7 +178,7 @@ export function formatContent(content: XHSContent, config: Config): FormattedCon
   }
 }
 
-export function createForwardMessage(content: FormattedContent, userId: string): ForwardMessage {
+export function createForwardMessage(content: FormattedContent, userId: string, config?: Config): ForwardMessage {
   const id = generateMessageId()
   
   const forwardElements: h.Fragment = []
@@ -176,8 +219,24 @@ export function createForwardMessage(content: FormattedContent, userId: string):
   
   if (content.videos.length > 0) {
     forwardElements.push(h('text', `🎬 视频 (${content.videos.length}个):\n`))
-    content.videos.forEach(url => {
-      forwardElements.push(h('video', { url }))
+    
+    content.videos.forEach((video, index) => {
+      const videoInfo = []
+      if (config?.showVideoMetadata !== false) {
+        if (video.duration && video.duration > 0) {
+          videoInfo.push(`时长: ${formatDuration(video.duration)}`)
+        }
+        if (video.width && video.height) {
+          videoInfo.push(`分辨率: ${video.width}x${video.height}`)
+        }
+        if (video.format && video.format !== 'unknown') {
+          videoInfo.push(`格式: ${video.format.toUpperCase()}`)
+        }
+      }
+      
+      const infoText = videoInfo.length > 0 ? ` ${videoInfo.join(' | ')}` : ''
+      forwardElements.push(h('text', `视频${index + 1}${infoText}\n`))
+      forwardElements.push(h('video', { url: video.url }))
     })
   }
   
@@ -230,7 +289,7 @@ export function validateUrl(url: string, allowedDomains: string[]): boolean {
   }
 }
 
-function isPrivateIP(hostname: string): boolean {
+export function isPrivateIP(hostname: string): boolean {
   // 检查是否为私有IP地址
   const privateRanges = [
     /^10\./,
@@ -246,8 +305,45 @@ function isPrivateIP(hostname: string): boolean {
   return privateRanges.some(range => range.test(hostname))
 }
 
-function isLocalhost(hostname: string): boolean {
+export function isLocalhost(hostname: string): boolean {
   return hostname === 'localhost' || hostname === '0.0.0.0' || hostname === '::1'
+}
+
+// 统一的去重函数
+export function deduplicateMedia<T extends XHSMedia>(items: T[]): T[] {
+  const seen = new Set<string>()
+  const result: T[] = []
+  for (const item of items) {
+    if (!item?.url) continue
+    if (seen.has(item.url)) continue
+    seen.add(item.url)
+    result.push(item)
+  }
+  return result
+}
+
+// 安全的 JSON 解析
+export function safeJsonParse<T = any>(text: string, maxSize: number = MAX_JSON_SIZE): T | null {
+  if (!text || text.length > maxSize) {
+    return null
+  }
+  try {
+    return JSON.parse(text) as T
+  } catch {
+    return null
+  }
+}
+
+// 安全清理HTML内容
+export function sanitizeHtml(html: string): string {
+  return html
+    .replace(/<script[^>]*>[\s\S]*?<\/script>/gi, '')
+    .replace(/on\w+="[^"]*"/gi, '')
+    .replace(/on\w+='[^']*'/gi, '')
+    .replace(/javascript:/gi, '')
+    .replace(/vbscript:/gi, '')
+    // 只移除 data: 后跟非图片 MIME 的内容
+    .replace(/data:(?!image\/)/gi, 'blocked:')
 }
 
 function formatNumber(num: number): string {
@@ -259,8 +355,31 @@ function formatNumber(num: number): string {
   return num.toString()
 }
 
+function formatDuration(duration: number): string {
+  if (!Number.isFinite(duration) || duration <= 0) return ''
+  
+  const hours = Math.floor(duration / 3600)
+  const minutes = Math.floor((duration % 3600) / 60)
+  const seconds = Math.floor(duration % 60)
+  
+  if (hours > 0) {
+    return `${hours}:${minutes.toString().padStart(2, '0')}:${seconds.toString().padStart(2, '0')}`
+  } else {
+    return `${minutes}:${seconds.toString().padStart(2, '0')}`
+  }
+}
+
 function generateMessageId(): string {
-  return Date.now().toString(36) + Math.random().toString(36).substr(2)
+  // 使用更安全的 ID 生成，添加计数器避免冲突
+  const timestamp = Date.now().toString(36)
+  const random1 = Math.random().toString(36).substr(2, 9)
+  const random2 = Math.random().toString(36).substr(2, 9)
+  return `${timestamp}-${random1}-${random2}`
+}
+
+// 类型守卫函数
+export function hasPuppeteer(ctx: any): ctx is { puppeteer: { page: () => Promise<any> } } {
+  return ctx && typeof ctx.puppeteer === 'object' && typeof ctx.puppeteer.page === 'function'
 }
 
 export function createErrorMessage(error: string): h.Fragment {
