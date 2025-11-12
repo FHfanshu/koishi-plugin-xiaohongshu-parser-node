@@ -132,3 +132,6 @@ temp/
 # Internal planning files
 AGENTS.plan.md
 AGENTS.md
+
+# Claude AI files
+.claude/
