@@ -1,0 +1,50 @@
+{
+  "name": "koishi-plugin-xiaohongshu-parser-node",
+  "version": "0.0.2",
+  "description": "小红书分享链接解析插件，支持图文视频内容提取和bot合并转发",
+  "main": "lib/index.js",
+  "typings": "lib/index.d.ts",
+  "files": [
+    "lib",
+    "src"
+  ],
+  "author": "FHfanshu",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/FHfanshu/koishi-plugin-xiaohongshu-parser-node"
+  },
+  "keywords": [
+    "koishi",
+    "plugin",
+    "xiaohongshu",
+    "parser",
+    "social-media",
+    "red",
+    "rednote"
+  ],
+  "peerDependencies": {
+    "koishi": "^4.15.0"
+  },
+  "dependencies": {
+    "axios": "^1.6.0",
+    "cheerio": "^1.0.0-rc.12",
+    "puppeteer": "^23.10.4"
+  },
+  "devDependencies": {
+    "@types/node": "^20.0.0",
+    "typescript": "^5.0.0"
+  },
+  "scripts": {
+    "build": "tsc",
+    "dev": "tsc --watch",
+    "test": "echo \"No tests yet\" && exit 0"
+  },
+  "koishi": {
+    "description": "小红书分享链接解析插件",
+    "service": {
+      "required": ["http"],
+      "optional": ["database", "puppeteer"]
+    }
+  }
+}
