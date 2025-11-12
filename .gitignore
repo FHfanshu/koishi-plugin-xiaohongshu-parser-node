@@ -128,3 +128,7 @@ Thumbs.db
 test-results/
 cache/
 temp/
+
+# Internal planning files
+AGENTS.plan.md
+AGENTS.md
