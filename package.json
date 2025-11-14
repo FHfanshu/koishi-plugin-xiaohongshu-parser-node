@@ -1,6 +1,6 @@
 {
   "name": "koishi-plugin-xiaohongshu-parser-node",
-  "version": "0.0.6",
+  "version": "0.0.14",
   "description": "自用，小红书分享链接解析插件，支持图文视频内容提取和bot合并转发",
   "main": "lib/index.js",
   "typings": "lib/index.d.ts",
@@ -41,8 +41,12 @@
     "test": "echo \"No tests yet\" && exit 0"
   },
   "koishi": {
-    "description": "小红书分享链接解析插件",
+    "description": "自用，小红书分享链接解析插件，支持图文视频内容提取和bot合并转发",
     "service": {
+      "required": ["http"],
+      "optional": ["database", "puppeteer"]
+    },
+    "inject": {
       "required": ["http"],
       "optional": ["database", "puppeteer"]
     }
