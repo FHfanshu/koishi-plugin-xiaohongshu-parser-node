@@ -5,6 +5,8 @@ export interface BasicNote {
   coverImage?: string
   videos?: string[]
   url: string
+  videoBuffer?: Buffer
+  videoMimeType?: string
 }
 
 export interface BasicClientConfig {

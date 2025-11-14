@@ -135,6 +135,11 @@ export function renderBasicNote(note: BasicNote): h.Fragment {
     elements.push(h('img', { src: note.coverImage }))
   }
 
+  if (note.videoBuffer) {
+    const mime = note.videoMimeType || 'video/mp4'
+    elements.push(h.video(note.videoBuffer, mime))
+  }
+
   if (note.videos && note.videos.length) {
     for (const videoUrl of note.videos) {
       elements.push(h('video', { src: videoUrl }))

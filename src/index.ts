@@ -8,7 +8,11 @@ import {
   extractCandidateUrls,
   sanitizeExtractedUrl
 } from './utils'
-import type { BasicClientConfig } from './types'
+import type { BasicClientConfig, BasicNote } from './types'
+import os from 'node:os'
+import { promises as fs } from 'node:fs'
+import path from 'node:path'
+import nodeUrl from 'node:url'
 
 export const name = 'xiaohongshu-parser-node'
 
@@ -25,6 +29,8 @@ export interface Config {
   maxUrlsPerMessage?: number
   autoParseGuilds?: string[]
   autoParseUsers?: string[]
+  downloadVideoAsFile?: boolean
+  videoDownloadMode?: 'buffer' | 'file' | 'base64'
 }
 
 export const Config: Schema<Config> = Schema.object({
@@ -57,7 +63,17 @@ export const Config: Schema<Config> = Schema.object({
     .default([]),
   autoParseUsers: Schema.array(String)
     .description('自动解析白名单私聊（userId 或 platform:userId）')
-    .default([])
+    .default([]),
+  downloadVideoAsFile: Schema.boolean()
+    .description('尝试先下载首个视频并以文件形式发送，避免直链在 QQ 等平台上“资源已过期”（可能增加带宽消耗）')
+    .default(false),
+  videoDownloadMode: Schema.union([
+    Schema.const('buffer').description('使用二进制 Buffer 方式发送视频（推荐，默认）'),
+    Schema.const('file').description('写入临时文件并通过 file:// URL 发送（更接近 music-voice 文件模式）'),
+    Schema.const('base64').description('使用 base64:// 段发送视频（OneBot 常用格式）')
+  ])
+    .description('下载视频后在 OneBot / QQ 中采用的发送方式')
+    .default('buffer')
 })
 
 declare module 'koishi' {
@@ -94,7 +110,7 @@ export function apply(ctx: Context, config: Config) {
         if (options?.merge) {
           return await handleMultipleUrls(ctx, url, config)
         } else {
-          return await handleSingleUrl(url, config)
+          return await handleSingleUrl(ctx, url, config)
         }
       } catch (error) {
         const message = error instanceof Error ? error.message : '解析失败'
@@ -133,7 +149,7 @@ export function apply(ctx: Context, config: Config) {
       try {
         let result: h.Fragment
         if (limitedUrls.length === 1) {
-          result = await handleSingleUrl(limitedUrls[0], config)
+          result = await handleSingleUrl(ctx, limitedUrls[0], config)
         } else {
           result = await handleMultipleUrls(ctx, limitedUrls.join(' '), config)
         }
@@ -155,7 +171,7 @@ export function apply(ctx: Context, config: Config) {
   })
 }
 
-async function handleSingleUrl(url: string, config: Config): Promise<h.Fragment> {
+async function handleSingleUrl(ctx: Context, url: string, config: Config): Promise<h.Fragment> {
   const normalizedUrl = normalizeInputUrl(url, config.allowedDomains ?? DEFAULT_ALLOWED_DOMAINS)
   if (!normalizedUrl) {
     return createErrorMessage('链接无效或不在允许的域名中')
@@ -175,7 +191,8 @@ async function handleSingleUrl(url: string, config: Config): Promise<h.Fragment>
     console.log(`解析成功: ${note.title}（共 ${note.images.length} 张图片${extraVideoInfo}）`)
   }
 
-  const rendered = renderBasicNote(note)
+  const prepared = await prepareNoteVideos(ctx, note, config)
+  const rendered = renderBasicNote(prepared)
 
   if (config.enableForward) {
     return h('message', { forward: true }, rendered)
@@ -193,7 +210,7 @@ async function handleMultipleUrls(ctx: Context, text: string, config: Config): P
   }
 
   if (limitedUrls.length === 1) {
-    return await handleSingleUrl(limitedUrls[0], config)
+    return await handleSingleUrl(ctx, limitedUrls[0], config)
   }
 
   const client = new BasicXHSClient(createClientConfig(config))
@@ -219,7 +236,8 @@ async function handleMultipleUrls(ctx: Context, text: string, config: Config): P
         console.log(`解析成功: ${note.title}（共 ${note.images.length} 张图片${extraVideoInfo}）`)
       }
 
-      messages.push(renderBasicNote(note))
+      const prepared = await prepareNoteVideos(ctx, note, config)
+      messages.push(renderBasicNote(prepared))
     } catch (error) {
       const message = error instanceof Error ? error.message : '解析失败'
       if (config.enableLog) {
@@ -231,6 +249,92 @@ async function handleMultipleUrls(ctx: Context, text: string, config: Config): P
 
   // 使用 forward 标记让支持的平台以转发消息的形式展示多条解析结果
   return h('message', { forward: true }, ...messages)
+}
+
+async function prepareNoteVideos(ctx: Context, note: BasicNote, config: Config): Promise<BasicNote> {
+  if (!config.downloadVideoAsFile) {
+    return note
+  }
+
+  if (!note.videos || !note.videos.length) {
+    return note
+  }
+
+  const [firstVideo] = note.videos
+  if (!firstVideo || !firstVideo.startsWith('http')) {
+    return note
+  }
+
+  try {
+    const file = await ctx.http.file(firstVideo)
+    if (!file || !file.data) {
+      if (config.enableLog) {
+        console.log('下载视频失败：响应数据为空')
+      }
+      return note
+    }
+
+    const buffer = Buffer.from(file.data)
+    const mimeType = (file as any).type || (file as any).mime || 'video/mp4'
+    const mode = config.videoDownloadMode || 'buffer'
+
+    if (config.enableLog) {
+      console.log(`已下载首个视频（大小约 ${Math.round(buffer.length / 1024)} KB），发送模式：${mode}`)
+    }
+
+    if (mode === 'buffer') {
+      return {
+        ...note,
+        videoBuffer: buffer,
+        videoMimeType: mimeType,
+        videos: note.videos?.slice(1)
+      }
+    }
+
+    if (mode === 'file') {
+      const fileUrl = await createTempVideoFile(buffer, mimeType)
+      return {
+        ...note,
+        videos: [fileUrl, ...(note.videos?.slice(1) ?? [])],
+        videoBuffer: undefined,
+        videoMimeType: mimeType
+      }
+    }
+
+    const base64Data = buffer.toString('base64')
+    const base64Uri = `base64://${base64Data}`
+
+    return {
+      ...note,
+      videos: [base64Uri, ...(note.videos?.slice(1) ?? [])],
+      videoBuffer: undefined,
+      videoMimeType: mimeType
+    }
+  } catch (error) {
+    if (config.enableLog) {
+      console.log(`下载视频失败：${error instanceof Error ? error.message : String(error)}`)
+    }
+    return note
+  }
+}
+
+async function createTempVideoFile(buffer: Buffer, mimeType: string): Promise<string> {
+  const tmpDir = os.tmpdir()
+  const ext = getVideoFileExtension(mimeType)
+  const fileName = `xhs-video-${Date.now()}-${Math.random().toString(16).slice(2)}${ext}`
+  const filePath = path.join(tmpDir, fileName)
+
+  await fs.writeFile(filePath, buffer)
+  return nodeUrl.pathToFileURL(filePath).href
+}
+
+function getVideoFileExtension(mimeType: string): string {
+  const lower = mimeType.toLowerCase()
+  if (lower.includes('mp4')) return '.mp4'
+  if (lower.includes('webm')) return '.webm'
+  if (lower.includes('ogg') || lower.includes('ogv')) return '.ogv'
+  if (lower.includes('flv')) return '.flv'
+  return '.mp4'
 }
 
 function extractXhsUrlsFromText(text: string): string[] {

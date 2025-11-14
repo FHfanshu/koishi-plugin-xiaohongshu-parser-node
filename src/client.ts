@@ -141,7 +141,7 @@ export class BasicXHSClient {
     note.content = note.content.trim()
     note.images = this.deduplicateUrls(note.images)
     if (note.videos && note.videos.length) {
-      note.videos = this.deduplicateUrls(note.videos)
+      note.videos = this.deduplicateVideoUrls(note.videos)
     }
     note.coverImage = note.images[0] ?? (metaCover ? metaCover.trim() : undefined)
 
@@ -472,6 +472,8 @@ export class BasicXHSClient {
           'play_url',
           'videoUrl',
           'mainUrl',
+          'masterUrl',
+          'backupUrl',
           'url',
           'contentUrl',
           'h264',
@@ -497,6 +499,8 @@ export class BasicXHSClient {
     const candidates: Array<{ key: string; value: unknown }> = [
       { key: 'videoUrl', value: record.videoUrl },
       { key: 'mainUrl', value: record.mainUrl },
+      { key: 'masterUrl', value: (record as any).masterUrl },
+      { key: 'backupUrl', value: (record as any).backupUrl },
       { key: 'playUrl', value: record.playUrl },
       { key: 'video', value: record.video },
       { key: 'videos', value: record.videos },
@@ -510,6 +514,31 @@ export class BasicXHSClient {
       pushValue(value, key)
     }
 
+    // Fallback: BFS over the whole record to find any http video-like URLs
+    if (!results.length) {
+      const queue: unknown[] = [record]
+      const seen = new Set<unknown>()
+      const VIDEO_PATTERN = /\.(mp4|m3u8|flv|m4s)(\?|$)/i
+
+      while (queue.length && results.length < 10) {
+        const current = queue.shift()
+        if (!current || typeof current !== 'object' || seen.has(current)) {
+          continue
+        }
+        seen.add(current)
+
+        for (const [key, value] of Object.entries(current as Record<string, unknown>)) {
+          if (typeof value === 'string' && value.startsWith('http') && VIDEO_PATTERN.test(value)) {
+            const trimmed = value.trim()
+            debugInfo.push({ source: `bfs.${key}`, url: trimmed })
+            results.push(trimmed)
+          } else if (value && typeof value === 'object') {
+            queue.push(value)
+          }
+        }
+      }
+    }
+
     if (this.config.enableLog && debugInfo.length > 0) {
       this.logger.info(`视频提取详情（共 ${results.length} 个）：`)
       const preview = debugInfo.slice(0, 3)
@@ -521,7 +550,7 @@ export class BasicXHSClient {
       }
     }
 
-    return results
+    return this.deduplicateVideoUrls(results)
   }
 
   private extractImagesFromDetail(record: Record<string, any>): string[] {
@@ -878,6 +907,68 @@ export class BasicXHSClient {
       }
     }
     return result
+  }
+
+  private deduplicateVideoUrls(urls: string[]): string[] {
+    const seen = new Set<string>()
+    const result: string[] = []
+
+    for (const original of urls) {
+      const normalized = this.normalizeSingleVideoUrl(original)
+      if (!normalized) {
+        continue
+      }
+
+      const key = this.getVideoCanonicalKey(normalized)
+      if (seen.has(key)) {
+        continue
+      }
+      seen.add(key)
+      result.push(normalized)
+    }
+
+    return result
+  }
+
+  private getVideoCanonicalKey(urlStr: string): string {
+    const trimmed = urlStr.trim()
+    if (!trimmed) {
+      return ''
+    }
+
+    try {
+      const u = new URL(trimmed)
+      if (u.hostname.endsWith('xhscdn.com') && u.pathname.includes('/stream/')) {
+        // 对于小红书 CDN，将路径作为去重 key，忽略不同的镜像域名与查询参数
+        return u.pathname
+      }
+      return trimmed
+    } catch {
+      return trimmed
+    }
+  }
+
+  private normalizeSingleVideoUrl(urlStr: string): string | null {
+    const trimmed = urlStr.trim()
+    if (!trimmed) {
+      return null
+    }
+
+    try {
+      const u = new URL(trimmed)
+      // 对小红书 CDN 视频统一升级为 HTTPS，提升在客户端的兼容性
+      if (u.protocol === 'http:' && u.hostname.endsWith('xhscdn.com')) {
+        u.protocol = 'https:'
+        return u.toString()
+      }
+      return trimmed
+    } catch {
+      // 解析失败时，保留原始 http 开头的字符串，丢弃其它无效值
+      if (trimmed.startsWith('http')) {
+        return trimmed
+      }
+      return null
+    }
   }
 
   private firstString(...values: unknown[]): string {
